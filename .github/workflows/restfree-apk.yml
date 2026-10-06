@@ -8,13 +8,16 @@ on:
 
 jobs:
   build:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: restfree-apk-build
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -30,14 +33,15 @@ jobs:
       - name: Build debug APK
         run: gradle -p restfree-android assembleDebug --stacktrace
 
-      - name: Collect APK
+      - name: Copy APK
         run: |
-          mkdir -p apk-output
-          cp restfree-android/app/build/outputs/apk/debug/app-debug.apk apk-output/RestFree.apk
+          mkdir -p restfree-android/dist
+          cp restfree-android/app/build/outputs/apk/debug/app-debug.apk restfree-android/dist/RestFree.apk
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: RestFree-APK
-          path: apk-output/RestFree.apk
-          if-no-files-found: error
+      - name: Commit APK to build branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f restfree-android/dist/RestFree.apk
+          git commit -m "build: add RestFree APK" || exit 0
+          git push origin restfree-apk-build
