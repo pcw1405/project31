@@ -4,10 +4,13 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.SharedPreferences;
 import android.graphics.Color;
-import android.media.MediaPlayer;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
+import android.media.AudioTrack;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.ViewGroup;
 import android.widget.Button;
@@ -15,9 +18,6 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.InputStream;
 import java.text.SimpleDateFormat;
 import java.util.Calendar;
 import java.util.Locale;
@@ -27,7 +27,8 @@ public class MainActivity extends Activity {
     private static final String KEY_TOTAL = "total_study_time";
     private static final int GOAL = 900;
     private static final int STUDY_MINUTES = 60;
-    private static final String AUDIO_ASSET = "testcase29.m4a";
+    private static final int AUDIO_DURATION_SECONDS = 30 * 60;
+    private static final int SAMPLE_RATE = 16000;
 
     private int totalStudyTime = 0;
     private TextView totalView;
@@ -40,15 +41,18 @@ public class MainActivity extends Activity {
     private Button pauseButton;
     private SharedPreferences prefs;
 
-    private MediaPlayer mediaPlayer;
+    private AudioTrack audioTrack;
+    private Thread audioThread;
+    private volatile boolean audioThreadRunning = false;
+    private volatile boolean audioPlaying = false;
+    private long playedSamples = 0;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private final Runnable progressUpdater = new Runnable() {
+    private final Runnable uiUpdater = new Runnable() {
         @Override
         public void run() {
             updateAudioTime();
-            if (mediaPlayer != null) {
-                handler.postDelayed(this, 500);
-            }
+            handler.postDelayed(this, 500);
         }
     };
 
@@ -71,19 +75,11 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = new TextView(this);
-        title.setText("레스트프리 1H");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(30);
-        title.setGravity(Gravity.CENTER);
+        TextView title = centered("레스트프리 1H", 30, Color.WHITE);
         title.setTypeface(null, android.graphics.Typeface.BOLD);
         root.addView(title, matchWrap(dp(6)));
 
-        TextView subtitle = new TextView(this);
-        subtitle.setText("공부 시작 시간 + 1시간 완료 시간 · 33분 오디오");
-        subtitle.setTextColor(Color.rgb(170, 178, 189));
-        subtitle.setTextSize(14);
-        subtitle.setGravity(Gravity.CENTER);
+        TextView subtitle = centered("1시간 공부 시각 + 30분 집중 사운드", 14, Color.rgb(170, 178, 189));
         root.addView(subtitle, matchWrap(dp(18)));
 
         Button studyStart = new Button(this);
@@ -91,26 +87,26 @@ public class MainActivity extends Activity {
         studyStart.setTextSize(21);
         studyStart.setAllCaps(false);
         studyStart.setOnClickListener(v -> showStudyTimes());
-        LinearLayout.LayoutParams studyButtonParams = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams studyParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(68));
-        studyButtonParams.setMargins(0, 0, 0, dp(14));
-        root.addView(studyStart, studyButtonParams);
+        studyParams.setMargins(0, 0, 0, dp(14));
+        root.addView(studyStart, studyParams);
 
-        startTimeView = makeCenteredText("현재 시간: -", 18, Color.WHITE);
+        startTimeView = centered("현재 시간: -", 18, Color.WHITE);
         root.addView(startTimeView, matchWrap(dp(5)));
 
-        endTimeView = makeCenteredText("완료 시간: -", 21, Color.rgb(125, 220, 120));
+        endTimeView = centered("완료 시간: -", 21, Color.rgb(125, 220, 120));
         endTimeView.setTypeface(null, android.graphics.Typeface.BOLD);
         root.addView(endTimeView, matchWrap(dp(24)));
 
-        TextView audioTitle = makeCenteredText("🎵 testcase29.m4a", 20, Color.WHITE);
+        TextView audioTitle = centered("🎵 30분 집중 사운드", 20, Color.WHITE);
         audioTitle.setTypeface(null, android.graphics.Typeface.BOLD);
         root.addView(audioTitle, matchWrap(dp(4)));
 
-        audioStatusView = makeCenteredText("오디오 준비 중...", 14, Color.rgb(170, 178, 189));
+        audioStatusView = centered("준비 완료", 14, Color.rgb(170, 178, 189));
         root.addView(audioStatusView, matchWrap(dp(4)));
 
-        audioTimeView = makeCenteredText("00:00 / 33:23", 16, Color.rgb(200, 205, 212));
+        audioTimeView = centered("00:00 / 30:00", 16, Color.rgb(200, 205, 212));
         root.addView(audioTimeView, matchWrap(dp(10)));
 
         LinearLayout audioControls = new LinearLayout(this);
@@ -121,14 +117,12 @@ public class MainActivity extends Activity {
         playButton.setText("▶ 재생");
         playButton.setTextSize(18);
         playButton.setAllCaps(false);
-        playButton.setEnabled(false);
         playButton.setOnClickListener(v -> playAudio());
 
         pauseButton = new Button(this);
         pauseButton.setText("⏸ 일시정지");
         pauseButton.setTextSize(18);
         pauseButton.setAllCaps(false);
-        pauseButton.setEnabled(false);
         pauseButton.setOnClickListener(v -> pauseAudio());
 
         LinearLayout.LayoutParams audioBtn = new LinearLayout.LayoutParams(0, dp(62), 1f);
@@ -139,17 +133,21 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView separator = makeCenteredText("────────────", 14, Color.rgb(70, 75, 82));
+        TextView note = centered("잔잔한 합성 집중음입니다. 일시정지 후 같은 위치에서 이어집니다.",
+                13, Color.rgb(150, 158, 168));
+        root.addView(note, matchWrap(dp(18)));
+
+        TextView separator = centered("────────────", 14, Color.rgb(70, 75, 82));
         root.addView(separator, matchWrap(dp(12)));
 
-        TextView label = makeCenteredText("총 공부시간", 17, Color.rgb(190, 197, 205));
+        TextView label = centered("총 공부시간", 17, Color.rgb(190, 197, 205));
         root.addView(label, matchWrap(dp(3)));
 
-        totalView = makeCenteredText("0", 54, Color.WHITE);
+        totalView = centered("0", 54, Color.WHITE);
         totalView.setTypeface(null, android.graphics.Typeface.BOLD);
         root.addView(totalView, matchWrap(dp(1)));
 
-        TextView unit = makeCenteredText("초", 16, Color.rgb(170, 178, 189));
+        TextView unit = centered("초", 16, Color.rgb(170, 178, 189));
         root.addView(unit, matchWrap(dp(14)));
 
         LinearLayout controls = new LinearLayout(this);
@@ -200,20 +198,20 @@ public class MainActivity extends Activity {
         resetParams.setMargins(0, dp(12), 0, 0);
         root.addView(reset, resetParams);
 
-        goalView = makeCenteredText("", 13, Color.rgb(170, 178, 189));
+        goalView = centered("", 13, Color.rgb(170, 178, 189));
         root.addView(goalView, matchWrap(dp(7)));
 
-        TextView info = makeCenteredText(
-                "알림은 사용하지 않습니다.\n오디오는 일시정지한 위치에서 다시 이어서 재생됩니다.",
+        TextView info = centered("알림은 사용하지 않습니다. 공부시간은 자동 저장됩니다.",
                 13, Color.rgb(150, 158, 168));
         root.addView(info, matchWrap(0));
 
         setContentView(scrollView);
         saveAndRender();
         prepareAudio();
+        handler.post(uiUpdater);
     }
 
-    private TextView makeCenteredText(String text, int size, int color) {
+    private TextView centered(String text, int size, int color) {
         TextView v = new TextView(this);
         v.setText(text);
         v.setTextColor(color);
@@ -233,71 +231,108 @@ public class MainActivity extends Activity {
     }
 
     private void prepareAudio() {
-        try {
-            File audioFile = new File(getFilesDir(), AUDIO_ASSET);
-            if (!audioFile.exists() || audioFile.length() == 0) {
-                try (InputStream in = getAssets().open(AUDIO_ASSET);
-                     FileOutputStream out = new FileOutputStream(audioFile)) {
-                    byte[] buffer = new byte[64 * 1024];
-                    int read;
-                    while ((read = in.read(buffer)) != -1) {
-                        out.write(buffer, 0, read);
-                    }
-                }
-            }
+        int minBuffer = AudioTrack.getMinBufferSize(
+                SAMPLE_RATE,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT);
+        int bufferSize = Math.max(minBuffer, 4096);
 
-            mediaPlayer = new MediaPlayer();
-            mediaPlayer.setDataSource(audioFile.getAbsolutePath());
-            mediaPlayer.setOnPreparedListener(mp -> {
-                audioStatusView.setText("준비 완료 · 약 " + formatTime(mp.getDuration()));
-                playButton.setEnabled(true);
-                pauseButton.setEnabled(true);
-                updateAudioTime();
-                handler.post(progressUpdater);
-            });
-            mediaPlayer.setOnCompletionListener(mp -> {
-                audioStatusView.setText("재생 완료");
-                mp.seekTo(0);
-                updateAudioTime();
-            });
-            mediaPlayer.prepareAsync();
-        } catch (Exception e) {
-            audioStatusView.setText("오디오를 불러오지 못했습니다.");
-            playButton.setEnabled(false);
-            pauseButton.setEnabled(false);
-        }
+        audioTrack = new AudioTrack.Builder()
+                .setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build())
+                .setAudioFormat(new AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(SAMPLE_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build())
+                .setBufferSizeInBytes(bufferSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build();
+
+        audioThreadRunning = true;
+        audioThread = new Thread(() -> {
+            short[] buffer = new short[1024];
+            double phase1 = 0.0;
+            double phase2 = 0.0;
+            long totalSamples = (long) AUDIO_DURATION_SECONDS * SAMPLE_RATE;
+
+            while (audioThreadRunning) {
+                if (!audioPlaying) {
+                    SystemClock.sleep(20);
+                    continue;
+                }
+
+                if (playedSamples >= totalSamples) {
+                    audioPlaying = false;
+                    try { audioTrack.pause(); } catch (Exception ignored) {}
+                    runOnUiThread(() -> audioStatusView.setText("재생 완료"));
+                    continue;
+                }
+
+                int count = (int) Math.min(buffer.length, totalSamples - playedSamples);
+                for (int i = 0; i < count; i++) {
+                    double slow = Math.sin((playedSamples + i) * 2.0 * Math.PI * 0.08 / SAMPLE_RATE);
+                    double s1 = Math.sin(phase1);
+                    double s2 = Math.sin(phase2);
+                    double sample = (s1 * 0.55 + s2 * 0.25) * (0.55 + 0.12 * slow);
+
+                    phase1 += 2.0 * Math.PI * 174.61 / SAMPLE_RATE;
+                    phase2 += 2.0 * Math.PI * 261.63 / SAMPLE_RATE;
+                    if (phase1 > Math.PI * 2) phase1 -= Math.PI * 2;
+                    if (phase2 > Math.PI * 2) phase2 -= Math.PI * 2;
+
+                    buffer[i] = (short) (sample * 2200);
+                }
+
+                int written = audioTrack.write(buffer, 0, count, AudioTrack.WRITE_BLOCKING);
+                if (written > 0) playedSamples += written;
+            }
+        }, "RestFreeAudio");
+        audioThread.start();
     }
 
     private void playAudio() {
-        if (mediaPlayer != null && !mediaPlayer.isPlaying()) {
-            mediaPlayer.start();
+        if (audioTrack == null) return;
+
+        long totalSamples = (long) AUDIO_DURATION_SECONDS * SAMPLE_RATE;
+        if (playedSamples >= totalSamples) {
+            playedSamples = 0;
+            audioTrack.flush();
+        }
+
+        try {
+            audioTrack.play();
+            audioPlaying = true;
             audioStatusView.setText("재생 중");
+        } catch (Exception e) {
+            audioStatusView.setText("재생할 수 없습니다.");
         }
     }
 
     private void pauseAudio() {
-        if (mediaPlayer != null && mediaPlayer.isPlaying()) {
-            mediaPlayer.pause();
+        if (audioTrack == null) return;
+        audioPlaying = false;
+        try {
+            audioTrack.pause();
             audioStatusView.setText("일시정지");
-            updateAudioTime();
+        } catch (Exception ignored) {
         }
+        updateAudioTime();
     }
 
     private void updateAudioTime() {
-        if (mediaPlayer == null) return;
-        try {
-            audioTimeView.setText(formatTime(mediaPlayer.getCurrentPosition())
-                    + " / " + formatTime(mediaPlayer.getDuration()));
-        } catch (IllegalStateException ignored) {
-        }
+        long seconds = playedSamples / SAMPLE_RATE;
+        if (seconds < 0) seconds = 0;
+        if (seconds > AUDIO_DURATION_SECONDS) seconds = AUDIO_DURATION_SECONDS;
+        audioTimeView.setText(formatTime(seconds) + " / 30:00");
     }
 
-    private String formatTime(int millis) {
-        if (millis < 0) millis = 0;
-        int totalSeconds = millis / 1000;
-        int minutes = totalSeconds / 60;
-        int seconds = totalSeconds % 60;
-        return String.format(Locale.KOREA, "%02d:%02d", minutes, seconds);
+    private String formatTime(long seconds) {
+        long minutes = seconds / 60;
+        long remain = seconds % 60;
+        return String.format(Locale.KOREA, "%02d:%02d", minutes, remain);
     }
 
     private void saveAndRender() {
@@ -320,11 +355,20 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        handler.removeCallbacks(progressUpdater);
-        if (mediaPlayer != null) {
-            mediaPlayer.release();
-            mediaPlayer = null;
+        handler.removeCallbacks(uiUpdater);
+        audioPlaying = false;
+        audioThreadRunning = false;
+
+        if (audioTrack != null) {
+            try {
+                audioTrack.pause();
+                audioTrack.flush();
+                audioTrack.release();
+            } catch (Exception ignored) {
+            }
+            audioTrack = null;
         }
+
         super.onDestroy();
     }
 }
